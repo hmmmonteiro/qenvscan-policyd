@@ -1,7 +1,7 @@
 all: qenvscan-policyd
 
 clean:
-	rm -f qenvscan-policyd qenvscan-policyd.o *~ core
+	rm -f qenvscan-policyd *~ core
 
 .c.o:
 	$(CC) $(CFLAGS) -c $< -o $@
