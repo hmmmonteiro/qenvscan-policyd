@@ -79,11 +79,6 @@
 #define GREYLISTED		"Greylisted (see http://projects.puremagic.com/greylisting/)"
 #define REJECTED		"You have been blacklisted. Contact you system administrator."
 
-/* config*/
-#define POSTGREY    %POLICYD_SERVER% /*where it is running, gethostbyname notation*/
-#define PORT        %POLICYD_PORT%       /* port to connect to postgrey on.*/
-/* end config */
-
 int main(int argc, char *argv[]) {
     int i, j, sock, size, policyd_port, len ;
 	int keylen=0, valuelen=0;
