@@ -65,164 +65,265 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <unistd.h>
+#include <limits.h>
 
-
-#define SIZEOF_INT		sizeof(int)
-
-#define ANSWER_GREYLIST	"DEFER_IF_PERMIT"
-#define ANSWER_GO		"DUNNO"
-#define ANSWER_PERM		"REJECT"
-#define EXIT_GO			0   /* good to go, accept email */
-#define EXIT_PERM		100 /* permanent reject of mail */
-#define EXIT_TEMP		101 /* tempfail, aka graylist */
 #define EXIT_ERROR		102  /* something went wrong */
 #define GREYLISTED		"Greylisted (see http://projects.puremagic.com/greylisting/)"
 #define REJECTED		"You have been blacklisted. Contact you system administrator."
+#define PLAIN			"plain"
 
-int main(int argc, char *argv[]) {
-    int i, j, sock, size, policyd_port, len ;
-	int keylen=0, valuelen=0;
+/* nice to have to access keys */
+enum KEY_REQ {
+	KEY_REQUEST = 0,
+	KEY_PROTO_NAME,
+	KEY_PROTO_STATE,
+	KEY_CLIENT_ADDR,
+	KEY_CLIENT_NAME,
+	KEY_SENDER,
+	KEY_RCPT,
+	KEY_HELO_NAME,
+	KEY_INSTANCE,
+	KEY_SIZE,
+	KEY_RCPT_COUNT,
+	KEY_SASL_METHOD,
+	KEY_SASL_USERNAME
+};
+
+/* policyd keys */
+struct pkeys {
+	char *key;
+	char *val;
+	unsigned int ksize;
+	unsigned int vsize;
+};
+
+/* macro to build array of keys, precompute available sizes to speed up */
+#define ARRAYADD(k,v)  { k, v, sizeof k - 1, sizeof v - 1 }
+
+/* policyd protocol keys. NULLs will be filled runtime (or not) */
+struct pkeys keys[] = {
+	ARRAYADD("request=",        	"smtpd_access_policy"),
+	ARRAYADD("protocol_name=",  	"SMTP"),
+	ARRAYADD("protocol_state=", 	"RCPT"), /* defaults to RCPT, rebuilt later if defined */
+	ARRAYADD("client_address=", 	NULL), /* build later: must exist */
+	ARRAYADD("client_name=",    	NULL), /* build later: must exist */
+	ARRAYADD("sender=",         	NULL), /* build later: must exist */
+	ARRAYADD("recipient=",      	NULL), /* build later: must exist */
+	ARRAYADD("helo_name=",		NULL), /* build later: must exist */
+	ARRAYADD("instance=",      	NULL), /* build later: may exist */
+	ARRAYADD("size=",           	NULL), /* build later: may exist */
+	ARRAYADD("recipient_count=",	NULL), /* build later: may exist */
+	ARRAYADD("sasl_method=",	NULL), /* build later: may exist */
+	ARRAYADD("sasl_username=",	NULL), /* build later: may exist */
+	{ NULL, NULL, 0, 0 }
+};
+
+/* macro to add new values+vsizes to keys */
+#define KEYSET(i,v) \
+	keys[i].val = v; \
+	keys[i].vsize = keys[i].val ? strlen(keys[i].val) : 0;
+
+/* policy actions */
+struct pactions {
+	char *act;
+	unsigned int ret;
+};
+
+/* policyd action keys */
+struct pactions actions[] = {
+	{ "DEFER_IF_PERMIT", 	101 }, /* tempfail, aka graylist */
+	{ "DEFER",		101 }, /* tempfail, aka graylist */
+	{ "REJECT_IF_PERMIT",	100 }, /* permanent reject of mail */ 
+	{ "REJECT",		100 }, /* permanent reject of mail */
+	{ "DUNNO",		0 },   /* good to go, accept email */
+	{ NULL,			EXIT_ERROR }  /* default */
+};
+
+#define ORDERLY_EXIT(e) \
+	if (sock >= 0) close(sock); \
+	if (query) free(query); \
+	exit(e);
+
+void usage(char *err)
+{
+	printf("qenvscan-policyd: %s\n", err);
+	exit(EXIT_ERROR);
+}
+
+int main(int argc, char *argv[])
+{
+	int i, j, sock, size, policyd_port, len ;
 	long lpolicyd_port;
-    struct sockaddr_in saddr;
-    struct hostent *hp;
-    char answer[32];
+	struct sockaddr_in saddr;
+	struct hostent *hp;
+	char answer[32];
 	char *policyd_server, *policyd_env_port, *end_ptr;
+	/* smtp data */
+	char *remoteip, *smtp_state, *sender, *recipient, *helo, *mailsize, *rcpt_count, *instance;
+	char *query, *p;
 
-	char *key[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-	char *value[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-	char *query;
+	query = NULL;
+	sock = -1;
+
+	sender = recipient = helo = NULL;
+
+	/* get envelope data, either from command line of env */
+#ifdef QENVSCAN_LEGACY
+	/* if LEGACY we expect to get something from command line or FAIL */
+	if (argc != 3 && argc != 4 && argc != 5)
+		usage("use with qenvscan-policyd mailfrom.s addr.s [ helohost.s [ size ] ]");
 	
-	int keylens[8];
-	int valuelens[8];
+	sender = argv[1];
+	recipient = argv[2];
+	helo = argv[3];
+	mailsize = (argc == 5) ? argv[4] : NULL;
+#else
+	/* if !LEGACY we expect to get something from env or FAIL */
+	sender = getenv("SENDER");
+	recipient = getenv("RECIPIENT");
 
+	if (!sender || !recipient)
+		usage("you need to define SENDER and RECIPIENT");
+#endif
+#ifdef DEBUG
+	fprintf(stderr,"QenvScan started.\n");
+#endif
 	policyd_server = getenv("POLICYD_SERVER");
 	policyd_env_port = getenv("POLICYD_PORT");
+	helo = getenv("HELO");
+	remoteip = getenv("TCPREMOTEIP");
+	mailsize = getenv("SIZE");
+	rcpt_count = getenv("RCPTCOUNT");
+	instance = getenv("SESSIONID");
+
+	if ( !remoteip || !policyd_server || !policyd_env_port )
+		usage("TCPREMOTEIP, POLICYD_SERVER or POLICYD_PORT not set!");
+
+	errno = 0;
+
+	lpolicyd_port = strtol(policyd_env_port, &end_ptr, 0);
+
+	if ( errno != 0 || lpolicyd_port < INT_MIN || 
+			lpolicyd_port > INT_MAX || *end_ptr != '\0')
+		usage("invalid POLICYD_PORT port number");
+
+	policyd_port = (int)lpolicyd_port;
+
+	/* set runtime envelope keys: */
+
+	KEYSET(KEY_CLIENT_ADDR, remoteip);
+
+	p = getenv("SMTPSTATE");
+	if (p) /* override the default */
+		KEYSET(KEY_PROTO_STATE, p);
+
+	p = getenv("AUTH_USER");
+	if (p) { /* set authenticated username if available */
+		KEYSET(KEY_SASL_METHOD, PLAIN);
+		KEYSET(KEY_SASL_USERNAME, p);
+	}
 	
-    if ((argc < 3 ) || getenv("TCPREMOTEIP") == NULL || policyd_server == NULL || policyd_env_port == NULL ) {
-        fprintf(stderr,"usage:  qenvscan-policyd mailfrom.s addr.s [helohost.s]\n");
-        if ( getenv("TCPREMOTEIP") == NULL || policyd_server == NULL || policyd_env_port == NULL ) {
-            fprintf(stderr,"TCPREMOTEIP, POLICYD_SERVER or POLICYD_PORT not set!\n");
-        }
-        exit(EXIT_ERROR);
-    } else {
-		errno=0;
-		lpolicyd_port = strtol(policyd_env_port, &end_ptr, 0);
-		if ( (errno != 0) || (lpolicyd_port < INT_MIN) || (lpolicyd_port > INT_MAX) || (*end_ptr != '\0')) {
-			fprintf(stderr, "qenvscan-policyd: invalid POLICYD_PORT port number\n");
-			exit(EXIT_ERROR);
-		} else
-			policyd_port = (int)lpolicyd_port;
-    }
+	KEYSET(KEY_RCPT_COUNT, rcpt_count);
 
-	key[0] = "request=";
-	key[1] = "protocol_name=";
-	key[2] = "protocol_state=";
-	key[3] = "client_address=";
-	key[4] = "client_name=";
-	key[5] = "sender=";
-	key[6] = "recipient=";
-	key[7] = argv[3] != NULL ? "helo_name=" : 0;
+	KEYSET(KEY_INSTANCE, instance);
 
-	value[0] = "smtpd_access_policy";
-	value[1] = "SMTP";
-	value[2] = "RCPT";
-	value[3] = getenv("TCPREMOTEIP");
-	value[4] = getenv("TCPREMOTEHOST") != NULL ? getenv("TCPREMOTEHOST") : getenv("TCPREMOTEIP");
-	value[5] = argv[1];
-	value[6] = argv[2];
-	value[7] = argv[3] != NULL ? argv[3] : 0;
+	p = getenv("TCPREMOTEHOST");
+	if (!p) p = keys[KEY_CLIENT_ADDR].val;
+	KEYSET(KEY_CLIENT_NAME, p);
 
-	for (i=0;i<sizeof(key)/SIZEOF_INT;i++) {
-		if (key[i] != NULL) {
-			keylens[i] = strlen(key[i]);
-			keylen += keylens[i];
-		}
+	KEYSET(KEY_SENDER, sender);
+	KEYSET(KEY_RCPT, recipient);
+
+	/* these may exist or not */
+	if (helo)
+		KEYSET(KEY_HELO_NAME, helo );
+	if (mailsize)
+		KEYSET(KEY_SIZE, mailsize );
+
+	/* calculate buffer size */
+	for ( len = 1, i = 0 ; keys[i].key ; i++ ) {
+		if (keys[i].val) /* just add if val != NULL */
+			len += (keys[i].ksize + keys[i].vsize + 1);
 	}
-
-	for (i=0;i<sizeof(value)/SIZEOF_INT;i++) {
-		if (value[i] != NULL) {
-			valuelens[i] = strlen(value[i]);
-			valuelen += valuelens[i];
-		}
-	}
-
-	len = keylen + valuelen + sizeof(key)/SIZEOF_INT + 2;
 
 	query = malloc(len);
+	if (!query) {
+		fprintf(stderr,"Failed to alloc memory for query: %s\n", strerror(errno));
+		exit(EXIT_ERROR);
+	}
 
-	for (i=j=0;i<sizeof(key)/SIZEOF_INT && j<len;i++) {
-		if (key[i] != NULL && value[i] != NULL) {
-			strcpy(query+j, key[i]);
-			j += keylens[i];
-			strcpy(query+j, value[i]);
-			j += valuelens[i];
-			query[j++] = '\n';
+	/* fill query buffer */
+	for ( j = i = 0 ; keys[i].key && i < len ; i++ ) {
+		if (keys[i].val) { /* just put entry if val != NULL */
+			strncpy(query + j, keys[i].key, keys[i].ksize);
+			j += keys[i].ksize;
+
+			strncpy(query + j, keys[i].val, keys[i].vsize);
+			j += keys[i].vsize;
+
+			query[j++] = '\n'; /* and so we have a key = val line */
 		}
 	}
 	query[j++] = '\n';
 	query[j++] = '\0';
-	
-    /* init so we have all the structs for connect */
-    bzero(&saddr, sizeof (saddr));
-    saddr.sin_family = AF_INET;
 
-    if ((hp = gethostbyname(policyd_server)) == NULL) {
-        perror("gethostbyname");
-		free(query);
-        return EXIT_ERROR;
-    }
+	/* init so we have all the structs for connect */
+	bzero(&saddr, sizeof (saddr));
+	saddr.sin_family = AF_INET;
 
-    bcopy(hp->h_addr, &saddr.sin_addr, hp->h_length);
-    saddr.sin_port = htons(policyd_port);
+	if ((hp = gethostbyname(policyd_server)) == NULL) {
+		perror("gethostbyname");
+		ORDERLY_EXIT(EXIT_ERROR);
+	}
 
-    /* get a socket */
-    if ((sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1) {
-        perror("socket");
-		free(query);
-        return EXIT_ERROR;
-    }
+	bcopy(hp->h_addr, &saddr.sin_addr, hp->h_length);
+	saddr.sin_port = htons(policyd_port);
 
-    /* connect the socket to the other end */
-    if (connect(sock, (struct sockaddr *)&saddr, sizeof (saddr)) != 0) {
-        perror("connect");
-		free(query);
-        return EXIT_ERROR;
-    }
+	/* get a socket */
+	if ((sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1) {
+		perror("socket");
+		ORDERLY_EXIT(EXIT_ERROR);
+	}
 
-    /* send the query */
-    if ( send(sock,query,strlen(query),0) != strlen(query)) {
-        perror("send");
-		free(query);
-        exit(EXIT_ERROR);
-    }
-    /* recive the answer from postgrey */
-    size = recv(sock, query, strlen(query), 0);
+	/* connect the socket to the other end */
+	if (connect(sock, (struct sockaddr *)&saddr, sizeof (saddr)) != 0) {
+		perror("connect");
+		ORDERLY_EXIT(EXIT_ERROR);
+	}
+
+	/* send the query */
+	if ( send(sock,query,strlen(query),0) != strlen(query)) {
+		perror("send");
+		ORDERLY_EXIT(EXIT_ERROR);
+	}
+	/* recive the answer from postgrey */
+	if ( (size = recv(sock, query, strlen(query), 0)) <= 0 ) {
+		fprintf(stderr,"Policy server recv error or shutdown: %s\n", strerror(errno));
+		ORDERLY_EXIT(EXIT_ERROR);
+	}
+
+	/* don't overflow query buffer */
+	query[size - 1] = '\0';
     
-    close(sock);
-    /* pase out the action=? */
-    if (sscanf(query,"action=%31s",answer) < 1 ) {
-        perror("sscanf");
-		free(query);
-        exit(EXIT_ERROR);
-    }
+	/* pase out the action=? */
+	if (sscanf(query,"action=%31s",answer) < 1 ) {
+		fprintf(stderr,"Policy server response contains no action: %s\n", query);
+		ORDERLY_EXIT(EXIT_ERROR);
+	}
 
-	free(query);
-	
-    /* figure out how to exit */
-	if ( strcasecmp(answer,ANSWER_PERM) == 0) {
-		/* is rejected */
-		exit(EXIT_PERM);
-	} else if ( strcasecmp(answer,ANSWER_GREYLIST) == 0) {
-        /* is greylisted */
-        exit(EXIT_TEMP);
-    } else if ( strcasecmp(answer,ANSWER_GO) == 0) {
-        /* is good to go */
-        exit(EXIT_GO);
-    } else {
-        fprintf(stderr,"Policy server response is strange to me : %s\n",query);
-        exit(EXIT_ERROR);
-    }
+	/* figure out how to exit */
+	for ( i = 0 ; actions[i].act ; i++ ) {
+		if ( strcasecmp(answer,actions[i].act) == 0 ) {
+#ifdef DEBUG
+			fprintf(stderr,"Policy server response was: %s\n", query);
+#endif
+			ORDERLY_EXIT(actions[i].ret);
+			break; /* well ... */
+		}
+	}
 
-    /* shud not happen, but anyway. */
-    exit(EXIT_GO);
+	/* actions fall to last element. ret defines the default return */
+	fprintf(stderr,"Policy server response is strange to me : %s\n",query);
+	ORDERLY_EXIT(actions[i].ret);
+
 }
