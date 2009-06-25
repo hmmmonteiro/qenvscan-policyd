@@ -66,11 +66,13 @@
 #include <errno.h>
 #include <unistd.h>
 #include <limits.h>
+#include <signal.h>
 
 #define EXIT_ERROR		102  /* something went wrong */
 #define GREYLISTED		"Greylisted (see http://projects.puremagic.com/greylisting/)"
 #define REJECTED		"You have been blacklisted. Contact you system administrator."
 #define PLAIN			"plain"
+#define CONNECT_TIMEOUT	10	/* timout connection to policyd server after 10 seconds */
 
 /* nice to have to access keys */
 enum KEY_REQ {
@@ -148,6 +150,13 @@ void usage(char *err)
 {
 	printf("qenvscan-policyd: %s\n", err);
 	exit(EXIT_ERROR);
+}
+
+void 
+sig_alrm(int signum)
+{
+   fprintf(stderr,"Policy server connect timeout: %s\n", strerror(errno));
+   exit(EXIT_ERROR);
 }
 
 int main(int argc, char *argv[])
@@ -285,10 +294,18 @@ int main(int argc, char *argv[])
 		ORDERLY_EXIT(EXIT_ERROR);
 	}
 
+	/* set alarm handler */
+	signal(SIGALRM, sig_alrm);
+	alarm(CONNECT_TIMEOUT);
+
 	/* connect the socket to the other end */
 	if (connect(sock, (struct sockaddr *)&saddr, sizeof (saddr)) != 0) {
-		perror("connect");
-		ORDERLY_EXIT(EXIT_ERROR);
+		if (errno != EINPROGRESS)
+		{
+			perror("connect");
+			ORDERLY_EXIT(EXIT_ERROR);
+		}
+		alarm( 0 ); /* cancel alarm */
 	}
 
 	/* send the query */
@@ -296,7 +313,7 @@ int main(int argc, char *argv[])
 		perror("send");
 		ORDERLY_EXIT(EXIT_ERROR);
 	}
-	/* recive the answer from postgrey */
+	/* recive the answer from policy daemon */
 	if ( (size = recv(sock, query, strlen(query), 0)) <= 0 ) {
 		fprintf(stderr,"Policy server recv error or shutdown: %s\n", strerror(errno));
 		ORDERLY_EXIT(EXIT_ERROR);

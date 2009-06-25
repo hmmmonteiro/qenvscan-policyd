@@ -1,0 +1,16 @@
+Build with:
+
+	$ make
+
+For legacy support, making qenvscan-policyd accept
+parameters on the command line, build with:
+
+	$ CFLAGS=-DQENVSCAN_LEGACY make
+
+To build with debugging support, build with:
+
+	$ CFLAGS=-DDEBUG make
+
+Of course, you can specify multiple CFLAGS options.
+Enjoy.
+
