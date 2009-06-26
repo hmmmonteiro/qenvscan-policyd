@@ -190,16 +190,14 @@ int main(int argc, char *argv[])
 	/* if !LEGACY we expect to get something from env or FAIL */
 	sender = getenv("SENDER");
 	recipient = getenv("RECIPIENT");
+	helo = getenv("HELO");
 
-	if (!sender || !recipient)
-		usage("you need to define SENDER and RECIPIENT");
-#endif
-#ifdef DEBUG
-	fprintf(stderr,"QenvScan started.\n");
+	if (!sender || !recipient || !helo)
+		usage("you need to define HELO, SENDER and RECIPIENT");
+
 #endif
 	policyd_server = getenv("POLICYD_SERVER");
 	policyd_env_port = getenv("POLICYD_PORT");
-	helo = getenv("HELO");
 	remoteip = getenv("TCPREMOTEIP");
 	mailsize = getenv("SIZE");
 	rcpt_count = getenv("RCPTCOUNT");
@@ -332,7 +330,7 @@ int main(int argc, char *argv[])
 	for ( i = 0 ; actions[i].act ; i++ ) {
 		if ( strcasecmp(answer,actions[i].act) == 0 ) {
 #ifdef DEBUG
-			fprintf(stderr,"Policy server response was: %s\n", query);
+			fprintf(stderr,"qenscan-policyd: server response was: %s\n", query);
 #endif
 			ORDERLY_EXIT(actions[i].ret);
 			break; /* well ... */
