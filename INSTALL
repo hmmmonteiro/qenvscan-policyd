@@ -1,4 +1,6 @@
-Build with:
+
+Build
+-----
 
 	$ make
 
@@ -12,5 +14,40 @@ To build with debugging support, build with:
 	$ CFLAGS=-DDEBUG make
 
 Of course, you can specify multiple CFLAGS options.
+
+
+Install
+-------
+
+cp qenvscan-policyd /path/to/binfiles
+
+e.g.
+	cp qenvscan-policyd /var/qmail/bin
+
+
+
+Use
+---
+
+If in LEGACY mode, you just need to define the following in your tcprules file
+ENVELOPE_SCANNER, POLICYD_SERVER and POLICYD_PORT
+
+e.g.
+	:allow,ENVELOPE_SCANNER="/var/qmail/bin/qenvscan-policyd",POLICYD_SERVER="10.10.10.10",POLICYD_PORT="10031"
+
+
+If NOT in LEGACY mode, you can additionally define at which protocol state you want to do the checkings. Do that defining
+PSTATE_RCPT and/or PSTATE_EOM
+
+e.g.
+	:allow,ENVELOPE_SCANNER="/var/qmail/bin/qenvscan-policyd",POLICYD_SERVER="10.10.10.10",POLICYD_PORT="10031",PSTATE_RCPT="",PSTATE_EOM=""
+
+The PSTATE_RCPT will make qenvscan-policyd check for sender, authenticated user (if SMTPAUTH was used), recipients, number of recipients, helo, remoteip, ESMTP size and client name at RCPT.
+
+The PSTATE_EOM will make qenvscan-policyd check for the real message size, just after the completion of the DATA command. This check will share the same instance ID, which will allow this check to be associated with the earlier PSTATE_RCPT check for the same message.
+
+
+As always, comments are most welcomed.
+
 Enjoy.
 
